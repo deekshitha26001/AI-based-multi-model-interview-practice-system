@@ -28,8 +28,6 @@ from face_service import analyze_face
 
 app = FastAPI(title="AI-Based Multimodal Interview Practice System")
 
-# Allow the Vercel-hosted frontend to call this API.
-# In production, replace "*" with your actual Vercel URL for tighter security.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,11 +48,6 @@ def on_startup():
 
 @app.post("/api/login", response_model=LoginResponse)
 def login(request: LoginRequest):
-    """
-    Simple email-based login — no password, no auth provider.
-    If the email already exists, log the user in.
-    If not, create a new user record.
-    """
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -105,7 +98,7 @@ def get_dashboard(user_id: int):
             "overall_score": r["overall_score"],
             "created_at": r["created_at"],
         }
-        for r in rows[:5]  # only the 5 most recent
+        for r in rows[:5]
     ]
 
     return DashboardResponse(
@@ -131,7 +124,6 @@ def start_interview(request: StartInterviewRequest):
     conn.commit()
     session_id = cursor.lastrowid
 
-    # Generate the first question (no previous Q&A yet)
     question_text = generate_question(
         interview_type=request.interview_type,
         resume_text=request.resume_text or "",
@@ -167,41 +159,28 @@ async def submit_answer(
     audio: UploadFile = File(...),
     face_images: List[UploadFile] = File(default=[]),
 ):
-    """
-    Accepts:
-    - The recorded answer audio (single file)
-    - A few webcam snapshot images taken during the answer
-    Processes them through speech + face services, evaluates the answer with AI,
-    stores everything, then either returns the NEXT question or triggers the FINAL REPORT
-    if this was the last question.
-    """
     conn = get_connection()
     cursor = conn.cursor()
 
-    # --- Save uploaded audio to a temp file for Whisper processing ---
     temp_dir = tempfile.mkdtemp()
     audio_path = os.path.join(temp_dir, "answer_audio.webm")
     with open(audio_path, "wb") as f:
         shutil.copyfileobj(audio.file, f)
 
-    # --- Save uploaded face snapshots to temp files ---
     image_paths = []
     for idx, img in enumerate(face_images):
-        img_path = os.path.join(temp_dir, f"frame_{idx}.jpg")
+        img_path = os.path.join(temp_dir, "frame_" + str(idx) + ".jpg")
         with open(img_path, "wb") as f:
             shutil.copyfileobj(img.file, f)
         image_paths.append(img_path)
 
     try:
-        # --- Speech: transcribe + analyze ---
         transcription_result = transcribe_audio(audio_path)
         answer_text = transcription_result["text"]
         voice_metrics = analyze_voice(transcription_result)
 
-        # --- Face: analyze snapshots ---
         face_metrics = analyze_face(image_paths)
 
-        # --- Fetch question text and interview type for AI evaluation ---
         cursor.execute("SELECT question_text FROM questions WHERE id = ?", (question_id,))
         question_row = cursor.fetchone()
         question_text = question_row["question_text"]
@@ -210,28 +189,22 @@ async def submit_answer(
         session_row = cursor.fetchone()
         interview_type = session_row["interview_type"]
 
-        # --- AI evaluation of this specific answer ---
         eval_result = evaluate_answer(question_text, answer_text, interview_type)
 
-        # --- Save answer + metrics to DB ---
         cursor.execute(
-            """INSERT INTO answers (question_id, answer_text, voice_metrics, face_metrics, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+            "INSERT INTO answers (question_id, answer_text, voice_metrics, face_metrics, created_at) VALUES (?, ?, ?, ?, ?)",
             (question_id, answer_text, json.dumps(voice_metrics), json.dumps(face_metrics), get_timestamp()),
         )
         conn.commit()
 
     finally:
-        # Clean up temp files regardless of success/failure
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-    # --- Decide: next question, or final report? ---
     if question_number >= TOTAL_QUESTIONS:
         report = _generate_and_save_report(session_id, interview_type, cursor, conn)
         conn.close()
         return {"is_complete": True, "report": report}
 
-    # --- Otherwise generate the next question, using all previous Q&A as context ---
     cursor.execute("""
         SELECT q.question_text as question, a.answer_text as answer
         FROM questions q JOIN answers a ON q.id = a.question_id
@@ -265,11 +238,7 @@ async def submit_answer(
     }
 
 
-def _generate_and_save_report(session_id: int, interview_type: str, cursor, conn) -> dict:
-    """
-    Internal helper: builds the full transcript with scores, asks the AI for a final
-    report, saves it, and marks the session as completed.
-    """
+def _generate_and_save_report(session_id, interview_type, cursor, conn):
     cursor.execute("""
         SELECT q.question_text as question, a.answer_text as answer, a.id as answer_id
         FROM questions q JOIN answers a ON q.id = a.question_id
@@ -277,11 +246,101 @@ def _generate_and_save_report(session_id: int, interview_type: str, cursor, conn
     """, (session_id,))
     qna_rows = [dict(row) for row in cursor.fetchall()]
 
-    # Re-evaluate each answer to build the scored transcript for the final report.
-    # (In submit_answer we already evaluated each one — for simplicity here we
-    # re-run evaluate_answer so this helper stays self-contained.)
     qna_with_scores = []
     for row in qna_rows:
         eval_result = evaluate_answer(row["question"], row["answer"], interview_type)
-        qna_with_scores.append({
+        entry = {
             "question": row["question"],
+            "answer": row["answer"],
+            "relevance": eval_result["relevance"],
+            "grammar": eval_result["grammar"],
+            "confidence": eval_result["confidence"],
+        }
+        qna_with_scores.append(entry)
+
+    report = generate_final_report(interview_type, qna_with_scores)
+
+    cursor.execute(
+        """INSERT INTO scores
+           (session_id, overall_score, communication_score, technical_score, confidence_score,
+            strengths, weaknesses, suggestions, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            session_id,
+            report["overall_score"],
+            report["communication_score"],
+            report["technical_score"],
+            report["confidence_score"],
+            json.dumps(report["strengths"]),
+            json.dumps(report["weaknesses"]),
+            json.dumps(report["suggestions"]),
+            get_timestamp(),
+        ),
+    )
+    cursor.execute("UPDATE interview_sessions SET status = 'completed' WHERE id = ?", (session_id,))
+    conn.commit()
+
+    return report
+
+
+# =========================================================
+# 5. GET FINAL REPORT
+# =========================================================
+
+@app.get("/api/interview/report/{session_id}", response_model=ScoreReport)
+def get_report(session_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM scores WHERE session_id = ?", (session_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Report not found for this session.")
+
+    return ScoreReport(
+        session_id=session_id,
+        overall_score=row["overall_score"],
+        communication_score=row["communication_score"],
+        technical_score=row["technical_score"],
+        confidence_score=row["confidence_score"],
+        strengths=json.loads(row["strengths"]),
+        weaknesses=json.loads(row["weaknesses"]),
+        suggestions=json.loads(row["suggestions"]),
+    )
+
+
+# =========================================================
+# 6. INTERVIEW HISTORY
+# =========================================================
+
+@app.get("/api/interview/history/{user_id}", response_model=List[HistoryItem])
+def get_history(user_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT sess.id as session_id, sess.interview_type, sess.created_at, s.overall_score
+        FROM interview_sessions sess
+        JOIN scores s ON sess.id = s.session_id
+        WHERE sess.user_id = ?
+        ORDER BY sess.created_at DESC
+    """, (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [
+        HistoryItem(
+            session_id=r["session_id"],
+            interview_type=r["interview_type"],
+            overall_score=r["overall_score"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+@app.get("/")
+def root():
+    return {"message": "AI-Based Multimodal Interview Practice System API is running."}
