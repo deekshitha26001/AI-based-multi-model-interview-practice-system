@@ -1,27 +1,44 @@
 """
 face_service.py
-Handles face analysis using OpenCV + MediaPipe Face Mesh.
+Handles face analysis using OpenCV + MediaPipe FaceLandmarker (Tasks API).
+
+Note: Newer mediapipe versions (0.10.30+) removed the older mp.solutions.face_mesh
+API and replaced it with the Tasks API (mp.tasks.vision.FaceLandmarker). This file
+uses that newer API. It downloads a small pretrained face landmark model file the
+first time it runs (cached in a temp folder), then uses it for all further requests.
 
 Approach: The frontend captures a few snapshot frames (e.g. every 2-3 seconds)
 from the webcam while the user is answering — NOT continuous video recording.
-This keeps bandwidth low and processing simple. Each frame is analyzed individually,
-then results are averaged into one final face metric per answer.
+Each frame is analyzed individually, then results are averaged into one final
+face metric per answer.
 
 Metrics are computed using simple, explainable geometry rules on facial landmarks
 (distances/ratios) rather than a trained deep-learning emotion classifier —
-consistent with the rule-based approach used in speech_service.py, and much
-easier to explain in a project viva.
+easy to explain in a project viva.
 """
 
-import cv2
-import mediapipe as mp
-import numpy as np
+import os
+import tempfile
+import urllib.request
 
-mp_face_mesh = mp.solutions.face_mesh
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+# --- Model setup ---
+# The Tasks API needs a small model file (.task). We download it once and cache
+# it in the system temp folder, instead of bundling it in the repo (keeps the
+# repo small and avoids committing binary files).
+MODEL_PATH = os.path.join(tempfile.gettempdir(), "face_landmarker.task")
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
 
 # Key landmark indices used from MediaPipe's 468-point face mesh
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+# (same indices work in both the old and new MediaPipe APIs)
 MOUTH_LEFT = 61
 MOUTH_RIGHT = 291
 MOUTH_TOP = 13
@@ -30,15 +47,55 @@ NOSE_TIP = 1
 LEFT_EYE_OUTER = 33
 RIGHT_EYE_OUTER = 263
 
+_landmarker = None  # cached singleton, created on first use
+
+
+def _ensure_model_downloaded():
+    """
+    Downloads the face landmark model file if it isn't already cached locally.
+    If a previous download attempt left a partial/corrupt file, it is removed
+    and re-downloaded.
+    """
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 0:
+        return
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    except Exception as e:
+        if os.path.exists(MODEL_PATH):
+            os.remove(MODEL_PATH)
+        raise RuntimeError(
+            "Could not download the face landmark model. "
+            "Check that the server has internet access. Original error: " + str(e)
+        )
+
+
+def _get_landmarker():
+    """
+    Returns a cached FaceLandmarker instance, creating it on first call.
+    Reusing one instance across requests avoids reloading the model every time.
+    """
+    global _landmarker
+    if _landmarker is None:
+        _ensure_model_downloaded()
+        base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            running_mode=vision.RunningMode.IMAGE,
+        )
+        _landmarker = vision.FaceLandmarker.create_from_options(options)
+    return _landmarker
+
 
 def _landmark_xy(landmarks, index, image_w, image_h):
     lm = landmarks[index]
     return np.array([lm.x * image_w, lm.y * image_h])
 
 
-def _analyze_single_frame(image_path: str, face_mesh) -> dict:
+def _analyze_single_frame(image_path: str, landmarker) -> dict:
     """
-    Runs MediaPipe Face Mesh on a single image and returns raw geometric measurements.
+    Runs FaceLandmarker on a single image and returns raw geometric measurements.
     Returns None if no face is detected in the frame.
     """
     image = cv2.imread(image_path)
@@ -47,12 +104,14 @@ def _analyze_single_frame(image_path: str, face_mesh) -> dict:
 
     h, w = image.shape[:2]
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb_image)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
 
-    if not results.multi_face_landmarks:
+    result = landmarker.detect(mp_image)
+
+    if not result.face_landmarks:
         return None
 
-    landmarks = results.multi_face_landmarks[0].landmark
+    landmarks = result.face_landmarks[0]  # first detected face
 
     # --- Smile detection: mouth width-to-face-width ratio ---
     mouth_left = _landmark_xy(landmarks, MOUTH_LEFT, w, h)
@@ -70,12 +129,11 @@ def _analyze_single_frame(image_path: str, face_mesh) -> dict:
     is_smiling = smile_ratio > 0.45 and mouth_open < (mouth_width * 0.5)
 
     # --- Eye contact estimation: nose position relative to eye-line center ---
-    # If nose tip is roughly centered between the eyes horizontally, user is facing camera
     nose = _landmark_xy(landmarks, NOSE_TIP, w, h)
     eye_center = (face_left + face_right) / 2
     horizontal_offset = abs(nose[0] - eye_center[0]) / face_width if face_width > 0 else 1
 
-    looking_at_camera = horizontal_offset < 0.15  # small offset = facing forward
+    looking_at_camera = horizontal_offset < 0.15
 
     return {
         "is_smiling": is_smiling,
@@ -96,18 +154,13 @@ def analyze_face(image_paths: list) -> dict:
             "confidence": 0.0,
         }
 
+    landmarker = _get_landmarker()
     frame_results = []
 
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-    ) as face_mesh:
-        for path in image_paths:
-            result = _analyze_single_frame(path, face_mesh)
-            if result:
-                frame_results.append(result)
+    for path in image_paths:
+        result = _analyze_single_frame(path, landmarker)
+        if result:
+            frame_results.append(result)
 
     total_frames = len(image_paths)
     detected_frames = len(frame_results)
@@ -126,7 +179,6 @@ def analyze_face(image_paths: list) -> dict:
     eye_contact_percentage = round((looking_count / detected_frames) * 100, 1)
     smile_percentage = round((smiling_count / detected_frames) * 100, 1)
 
-    # --- Dominant emotion (simple rule based on smile + eye contact) ---
     if smile_percentage > 50:
         dominant_emotion = "Happy / Positive"
     elif eye_contact_percentage < 40:
@@ -134,7 +186,6 @@ def analyze_face(image_paths: list) -> dict:
     else:
         dominant_emotion = "Neutral / Focused"
 
-    # --- Confidence score: combination of eye contact + face detection consistency ---
     detection_rate = detected_frames / total_frames
     confidence = (eye_contact_percentage / 100 * 6) + (detection_rate * 4)
     confidence = round(min(confidence, 10.0), 1)
