@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #FAF7F2;
+  font-family: 'Segoe UI', Arial, sans-serif;
+  color: #2E2018;
+}
+
+/* Simple reusable card style used across pages */
+.app-card {
+  background-color: #FFFFFF;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+/* Simple reusable button style */
+.btn-primary {
+  background-color: #7B4B2A;
+  color: #FFFFFF;
+  padding: 10px 20px;
+  border-radius: 10px;
+  font-weight: 500;
+  transition: background-color 0.2s ease;
+}
+
+.btn-primary:hover {
+  background-color: #4E2F1B;
+}
+
+.btn-primary:disabled {
+  background-color: #C9B8A8;
+  cursor: not-allowed;
+}
