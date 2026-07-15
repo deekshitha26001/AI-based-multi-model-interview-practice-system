@@ -15,8 +15,9 @@ load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# Free, fast Groq model — good enough for question generation + evaluation
-MODEL_NAME = "llama-3.3-70b-versatile"
+# Groq deprecated "llama-3.3-70b-versatile" in June 2026. Using their
+# recommended replacement model, which is free-tier available and fast.
+MODEL_NAME = "openai/gpt-oss-120b"
 
 TOTAL_QUESTIONS = 5  # fixed number of questions per interview, keeps flow simple
 
